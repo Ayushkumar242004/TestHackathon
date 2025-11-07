@@ -121,3 +121,68 @@ def purge_expired_certificates():
             s.add(c)
         s.commit()
         return len(expired)
+
+# app/crud.py (append or integrate into your existing file)
+from sqlmodel import Session, select
+from app.models import Inspection, Certificate  # ensure these exist
+from .settings import settings
+from sqlmodel import SQLModel
+
+# existing 'engine' creation should be present already
+# engine = create_engine(settings.DATABASE_URL, echo=False)
+
+def list_inspections(limit: int = 50, offset: int = 0):
+    """
+    Return a list of Inspection objects (limit/offset).
+    """
+    with Session(engine) as s:
+        q = select(Inspection).offset(offset).limit(limit)
+        rows = s.exec(q).all()
+        return rows
+
+def get_certificate_by_hash(cert_hash: str):
+    with Session(engine) as s:
+        # normalize cert_hash to '0x' prefixed if your DB uses that
+        q = select(Certificate).where(Certificate.cert_hash == cert_hash)
+        return s.exec(q).first()
+
+def list_certificates(only_valid: bool = False, limit: int = 50, offset: int = 0):
+    from time import time
+    now = int(time())
+    with Session(engine) as s:
+        q = select(Certificate)
+        if only_valid:
+            # certificate row must not be revoked and not expired
+            q = q.where(Certificate.revoked == False)
+            q = q.where((Certificate.expiry == 0) | (Certificate.expiry > now))
+        q = q.offset(offset).limit(limit)
+        return s.exec(q).all()
+    
+# app/crud.py additions (append)
+
+def get_inspection_by_id(inspection_id: int):
+    with Session(engine) as s:
+        q = select(Inspection).where(Inspection.id == inspection_id)
+        return s.exec(q).first()
+
+def list_inspections(limit: int = 50, offset: int = 0):
+    with Session(engine) as s:
+        q = select(Inspection).offset(offset).limit(limit)
+        return s.exec(q).all()
+
+def get_certificate_by_hash(cert_hash: str):
+    with Session(engine) as s:
+        q = select(Certificate).where(Certificate.cert_hash == cert_hash)
+        return s.exec(q).first()
+
+def list_certificates(only_valid: bool = False, limit: int = 100, offset: int = 0):
+    from time import time
+    now = int(time())
+    with Session(engine) as s:
+        q = select(Certificate)
+        if only_valid:
+            q = q.where(Certificate.revoked == False)
+            q = q.where((Certificate.expiry == 0) | (Certificate.expiry > now))
+        q = q.offset(offset).limit(limit)
+        return s.exec(q).all()
+

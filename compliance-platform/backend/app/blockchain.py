@@ -6,14 +6,14 @@ from app.settings import settings
 from hexbytes import HexBytes
 
 # load ABI
-# HERE = os.path.dirname(__file__)
-# ABI_PATH = os.path.join(os.path.dirname(HERE), "artifacts", "Compliance.json")  # path at project root
-# with open(ABI_PATH) as f:
-#     artifact = json.load(f)
-# ABI = artifact.get("abi", artifact)  # if the file is just the abi array
+HERE = os.path.dirname(__file__)
+ABI_PATH = os.path.join(os.path.dirname(HERE), "artifacts", "Compliance.json")  # path at project root
+with open(ABI_PATH) as f:
+    artifact = json.load(f)
+ABI = artifact.get("abi", artifact)  # if the file is just the abi array
 
 w3 = Web3(Web3.HTTPProvider(settings.RPC_URL))
-# contract = w3.eth.contract(address=Web3.to_checksum_address(settings.CONTRACT_ADDRESS), abi=ABI)
+contract = w3.eth.contract(address=Web3.to_checksum_address(settings.CONTRACT_ADDRESS), abi=ABI)
 
 def get_chain_id():
     return int(settings.CHAIN_ID)
@@ -84,44 +84,141 @@ def recover_signer_from_raw(raw_hash: bytes, signature: str) -> str:
     signer = w3.eth.account.recover_message(msg, signature=signature)
     return Web3.to_checksum_address(signer)
 
-# convenience contract calls
-def record_inspection_with_signature(submitter_private_key, content_hash, summary_hash, inspector, inspector_timestamp, nonce, signature, meta=b""):
+def _send_signed_transaction_and_wait(signed_tx):
+    """
+    Helper that works with both eth-account/web3 return shapes:
+      - signed_tx.rawTransaction  (older)
+      - signed_tx.raw_transaction (newer)
+    Returns the transaction receipt.
+    """
+    raw = None
+    # try both attribute names
+    if hasattr(signed_tx, "rawTransaction"):
+        raw = signed_tx.rawTransaction
+    elif hasattr(signed_tx, "raw_transaction"):
+        raw = signed_tx.raw_transaction
+    else:
+        # last-resort: look through dict representation
+        try:
+            raw = signed_tx.__dict__.get("rawTransaction") or signed_tx.__dict__.get("raw_transaction")
+        except Exception:
+            raw = None
+
+    if raw is None:
+        raise RuntimeError("Signed transaction object does not contain raw tx bytes (rawTransaction/raw_transaction)")
+
+    tx_hash = w3.eth.send_raw_transaction(raw)
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
+    return receipt
+
+
+def record_inspection_with_signature(
+    submitter_private_key,
+    content_hash,
+    summary_hash,
+    inspector,
+    inspector_timestamp,
+    nonce,
+    signature,
+    meta=b"",
+):
     acct = w3.eth.account.from_key(submitter_private_key)
+
     tx = contract.functions.recordInspectionWithSignature(
-        content_hash, summary_hash or b'\x00'*32, inspector, inspector_timestamp, nonce, signature, meta
+        HexBytes(content_hash),
+        HexBytes(summary_hash or b"\x00"*32),
+        Web3.to_checksum_address(inspector),
+        int(inspector_timestamp),
+        HexBytes(nonce),
+        HexBytes(signature),
+        meta,
     ).build_transaction({
         "from": acct.address,
         "nonce": w3.eth.get_transaction_count(acct.address),
-        "gas": 600000,
-        "gasPrice": w3.eth.gas_price
+        "gas": 800000,
+        "gasPrice": w3.eth.gas_price,
     })
-    signed = acct.sign_transaction(tx)
-    tx_hash = w3.eth.send_raw_transaction(signed.rawTransaction)
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
+
+    # Sign the tx
+    signed = w3.eth.account.sign_transaction(tx, private_key=submitter_private_key)
+    # Use helper to extract raw bytes and send
+    receipt = _send_signed_transaction_and_wait(signed)
     return receipt
+
 
 def issue_certificate(submitter_private_key, cert_hash, owner, expiry):
     acct = w3.eth.account.from_key(submitter_private_key)
-    tx = contract.functions.issueCertificate(cert_hash, owner, expiry).build_transaction({
+
+    tx = contract.functions.issueCertificate(
+        HexBytes(cert_hash),
+        Web3.to_checksum_address(owner),
+        int(expiry),
+    ).build_transaction({
         "from": acct.address,
         "nonce": w3.eth.get_transaction_count(acct.address),
         "gas": 400000,
-        "gasPrice": w3.eth.gas_price
+        "gasPrice": w3.eth.gas_price,
     })
-    signed = acct.sign_transaction(tx)
-    tx_hash = w3.eth.send_raw_transaction(signed.rawTransaction)
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
+
+    signed = w3.eth.account.sign_transaction(tx, private_key=submitter_private_key)
+    receipt = _send_signed_transaction_and_wait(signed)
     return receipt
+
 
 def revoke_certificate(submitter_private_key, cert_hash):
     acct = w3.eth.account.from_key(submitter_private_key)
-    tx = contract.functions.revokeCertificate(cert_hash).build_transaction({
+
+    tx = contract.functions.revokeCertificate(HexBytes(cert_hash)).build_transaction({
         "from": acct.address,
         "nonce": w3.eth.get_transaction_count(acct.address),
         "gas": 200000,
-        "gasPrice": w3.eth.gas_price
+        "gasPrice": w3.eth.gas_price,
     })
-    signed = acct.sign_transaction(tx)
-    tx_hash = w3.eth.send_raw_transaction(signed.rawTransaction)
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
+
+    signed = w3.eth.account.sign_transaction(tx, private_key=submitter_private_key)
+    receipt = _send_signed_transaction_and_wait(signed)
     return receipt
+
+
+def _role_bytes32(role_name: str) -> bytes:
+    # Accept either role name like "INSPECTOR_ROLE" or a bytes32 hex string
+    if role_name.startswith("0x") and len(role_name) == 66:
+        return HexBytes(role_name)
+    return Web3.keccak(text=role_name)  # returns bytes
+
+def grant_role(admin_private_key: str, role_name: str, target_address: str):
+    acct = w3.eth.account.from_key(admin_private_key)
+    role_b = _role_bytes32(role_name)
+    tx = contract.functions.grantRole(role_b, Web3.to_checksum_address(target_address)).build_transaction({
+        "from": acct.address,
+        "nonce": w3.eth.get_transaction_count(acct.address),
+        "gas": 200000
+    })
+    signed = w3.eth.account.sign_transaction(tx, private_key=admin_private_key)
+    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+    return w3.eth.wait_for_transaction_receipt(tx_hash)
+
+def revoke_role(admin_private_key: str, role_name: str, target_address: str):
+    acct = w3.eth.account.from_key(admin_private_key)
+    role_b = _role_bytes32(role_name)
+    tx = contract.functions.revokeRole(role_b, Web3.to_checksum_address(target_address)).build_transaction({
+        "from": acct.address,
+        "nonce": w3.eth.get_transaction_count(acct.address),
+        "gas": 200000
+    })
+    signed = w3.eth.account.sign_transaction(tx, private_key=admin_private_key)
+    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+    return w3.eth.wait_for_transaction_receipt(tx_hash)
+
+def has_role(role_name: str, address: str) -> bool:
+    role_b = _role_bytes32(role_name)
+    return contract.functions.hasRole(role_b, Web3.to_checksum_address(address)).call()
+
+def check_inspection_onchain(content_hash_hex: str) -> bool:
+    # contract has mapping seenInspections(bytes32) -> bool
+    h = content_hash_hex if content_hash_hex.startswith("0x") else "0x" + content_hash_hex
+    return contract.functions.seenInspections(HexBytes(h)).call()
+
+def is_certificate_valid(cert_hash_hex: str) -> bool:
+    h = cert_hash_hex if cert_hash_hex.startswith("0x") else "0x" + cert_hash_hex
+    return contract.functions.isCertificateValid(HexBytes(h)).call()

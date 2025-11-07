@@ -2,6 +2,8 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Optional
 class Settings(BaseSettings):
+    ADMIN_API_KEY: str = "0x94803bf3032ccf8c7605e96213c0b5f884cad8cfbc32365a71e959de891c1877"
+    DEPLOYER_PK: str | None = None
     RPC_URL: str
     CONTRACT_ADDRESS: str
     CHAIN_ID: int = 31337
